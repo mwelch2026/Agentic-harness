@@ -2,37 +2,33 @@
 /**
  * harness.js — HCD build harness (Legal System pipeline).
  *
- * Text in, one binary out. Takes a chunk-ingested tokenized template
- * (template.txt) plus a resolved matter map (data.json) and emits a DRAFT
+ * Text in, one binary out. Takes the certified tokenized template
+ * (hcd-template.txt) plus a resolved matter map (data.json) and emits a DRAFT
  * .docx reproducing the firm's certified Health Care Directive, using the
  * measured TR* style ramp from legal-design v1.0.
  *
+ * The template and its hash are fetched from git (raw.githubusercontent.com)
+ * by the pipeline — they never transit Claude's output. This harness gates on
+ * the hash so a truncated, partial, or altered template cannot build.
+ *
  * Subcommands:
- *   node harness.js verify [template.txt]
- *     Gate the ingested template: char/word/line counts + required tail
- *     markers. Exits non-zero if short or a tail marker is missing (i.e. the
- *     chunk-ingest truncated). This is the crash-vector guard.
- *   node harness.js build [template.txt] [data.json] [out.docx]
- *     Verify first, then parse, fill {{role.field}} tokens from data.json
- *     (filled red FF0000; unfilled tokens kept literal, also red), place the
- *     DRAFT marker, and write the .docx.
+ *   node harness.js verify [template.txt] [template.sha256]
+ *     Integrity gate: recompute SHA-256 of the template and compare to the
+ *     committed hash file. Exits non-zero on mismatch OR on a missing hash
+ *     file (fail closed). This is the crash-vector guard.
+ *   node harness.js build [template.txt] [data.json] [out.docx] [template.sha256]
+ *     Verify first (hash gate), then parse, fill {{role.field}} tokens from
+ *     data.json (filled red FF0000; unfilled tokens kept literal, also red),
+ *     place the DRAFT marker, and write the .docx.
  */
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
-/** Presence of every marker proves the ingest reached the document's end. */
-const TAIL_MARKERS = [
-  'STATEMENT OF FIRST WITNESS',
-  'SIGNATURE OF SECOND WITNESS',
-  'STATE OF TEXAS',
-  'PREPARATION STATEMENT',
-  '{{attorney.full_name}}',
-];
-
-/** Below this char count the ingest is assumed truncated. */
-const MIN_TEMPLATE_CHARS = 4000;
+/** Default canonical filenames (as committed to the Agentic-harness repo). */
+const DEFAULT_TEMPLATE = 'hcd-template.txt';
 
 /**
  * Read a UTF-8 file or exit with a clear message.
@@ -49,23 +45,60 @@ function readOrDie(file) {
 }
 
 /**
- * Verify the ingested template is complete (not truncated).
+ * Derive the hash-file path from a template path: foo.txt -> foo.sha256.
+ * @param {string} templateFile
+ * @returns {string}
+ */
+function deriveHashPath(templateFile) {
+  return templateFile.replace(/\.txt$/, '') + '.sha256';
+}
+
+/**
+ * SHA-256 (hex) of a file's raw bytes.
  * @param {string} file
+ * @returns {string}
+ */
+function sha256File(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+/**
+ * Integrity gate. Recompute the template's SHA-256 and compare to the
+ * committed hash file. Fails closed: a missing hash file is a FAIL, never a
+ * pass. The hash file may be a bare 64-char hex digest or `sha256sum` format
+ * (`<hash>  <name>`); only the first whitespace-delimited token is read.
+ * @param {string} file       template path
+ * @param {string} [hashFile] hash path (defaults to derived <template>.sha256)
  * @returns {{ok: boolean, report: string}}
  */
-function verifyTemplate(file) {
+function verifyTemplate(file, hashFile) {
   const text = readOrDie(file);
   const chars = text.length;
   const words = (text.match(/\S+/g) || []).length;
   const lines = text.split(/\r?\n/).length;
-  const missing = TAIL_MARKERS.filter((m) => !text.includes(m));
-  const tail = text.split(/\r?\n/).slice(-3).join('\n');
-  const ok = chars >= MIN_TEMPLATE_CHARS && missing.length === 0;
+
+  const hp = hashFile || deriveHashPath(file);
+  let ok = false;
+  let integrity;
+  if (!fs.existsSync(hp)) {
+    integrity =
+      `hash file: MISSING (${hp})\n` +
+      `integrity: FAIL — refusing (no hash to verify against)`;
+  } else {
+    const expected = readOrDie(hp).trim().split(/\s+/)[0].toLowerCase();
+    const actual = sha256File(file);
+    ok = expected.length === 64 && expected === actual;
+    integrity =
+      `hash file: ${hp}\n` +
+      `expected:  ${expected}\n` +
+      `actual:    ${actual}\n` +
+      `integrity: ${ok ? 'MATCH' : 'MISMATCH'}`;
+  }
+
   const report =
     `template: ${file}\n` +
     `chars=${chars} words=${words} lines=${lines}\n` +
-    `tail markers missing: ${missing.length ? missing.join(' | ') : 'none'}\n` +
-    `--- last 3 lines ---\n${tail}\n` +
+    `${integrity}\n` +
     `--- verify: ${ok ? 'PASS' : 'FAIL'} ---`;
   return { ok, report };
 }
@@ -280,9 +313,10 @@ function buildDocx(d, templateText, data) {
 /**
  * build subcommand: verify-gate, then parse + fill + write the .docx.
  * @param {string} templateFile @param {string} dataFile @param {string} outFile
+ * @param {string} [hashFile]
  */
-async function runBuild(templateFile, dataFile, outFile) {
-  const v = verifyTemplate(templateFile);
+async function runBuild(templateFile, dataFile, outFile, hashFile) {
+  const v = verifyTemplate(templateFile, hashFile);
   if (!v.ok) {
     console.error(v.report);
     console.error('FATAL: template failed verify — refusing to build.');
@@ -313,14 +347,14 @@ function main() {
   const cmd = process.argv[2];
   const a = process.argv.slice(3);
   if (cmd === 'verify') {
-    const { ok, report } = verifyTemplate(a[0] || 'template.txt');
+    const { ok, report } = verifyTemplate(a[0] || DEFAULT_TEMPLATE, a[1]);
     console.log(report);
     process.exit(ok ? 0 : 1);
   } else if (cmd === 'build') {
-    runBuild(a[0] || 'template.txt', a[1] || 'data.json', a[2] || 'HCD_DRAFT.docx');
+    runBuild(a[0] || DEFAULT_TEMPLATE, a[1] || 'data.json', a[2] || 'HCD_DRAFT.docx', a[3]);
   } else {
-    console.error('usage: node harness.js verify [template.txt]');
-    console.error('       node harness.js build [template.txt] [data.json] [out.docx]');
+    console.error('usage: node harness.js verify [template.txt] [template.sha256]');
+    console.error('       node harness.js build [template.txt] [data.json] [out.docx] [template.sha256]');
     process.exit(1);
   }
 }
